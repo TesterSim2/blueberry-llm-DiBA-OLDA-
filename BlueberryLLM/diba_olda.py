@@ -1,11 +1,38 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
-# ==========================================
-# 1. 1.58-Bit Quantization Kernels
-# ==========================================
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):
+    """Precompute complex RoPE frequencies for a maximum sequence length."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(end, device=device, dtype=torch.float)
+    freqs = torch.outer(t, freqs)
+    return torch.polar(torch.ones_like(freqs), freqs)
+
+
+def apply_rope(q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor):
+    """
+    Apply rotary position embeddings to query/key pairs.
+
+    Args:
+        q: Query tensor of shape (B, S, H, D)
+        k: Key tensor of shape (B, S, H, D)
+        freqs_cis: Precomputed RoPE cache of shape (S_max, D/2)
+    """
+    seq_len = q.shape[1]
+    rope = freqs_cis[:seq_len].unsqueeze(0).unsqueeze(2)  # (1, S, 1, D/2)
+
+    q_complex = torch.view_as_complex(q.reshape(*q.shape[:-1], -1, 2).float())
+    k_complex = torch.view_as_complex(k.reshape(*k.shape[:-1], -1, 2).float())
+
+    q_out = torch.view_as_real(q_complex * rope).flatten(-2)
+    k_out = torch.view_as_real(k_complex * rope).flatten(-2)
+    return q_out.type_as(q), k_out.type_as(k)
+
+
 class BitLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=False, flg_bit=True):
         super().__init__(in_features, out_features, bias=bias)
@@ -32,9 +59,7 @@ class BitLinear(nn.Linear):
         w_q = self.weight_quant(self.weight)
         return F.linear(x_q, w_q, self.bias)
 
-# ==========================================
-# 2. Neuro-Symbolic Gate
-# ==========================================
+
 class NeuroSymbolicGate(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -52,17 +77,15 @@ class NeuroSymbolicGate(nn.Module):
         feats = self.conv(x_perm).permute(0, 2, 1)
         return self.act(self.proj(feats))
 
-# ==========================================
-# 3. DiBA-OLDA Attention Layer (The Replacement)
-# ==========================================
+
 class Gated_DiBA_OLDA_Attention(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.d_model = args.dim
         self.n_heads = args.n_heads
-        self.d_head = args.head_dim
-        self.d_latent = args.kv_lora_rank  # Blueberry likely uses this name for c_KV
-        self.use_bitnet = getattr(args, 'use_bitnet', True)
+        self.d_head = getattr(args, "head_dim", self.d_model // self.n_heads)
+        self.d_latent = getattr(args, "kv_lora_rank", self.d_model // self.n_heads)
+        self.use_bitnet = getattr(args, "use_bitnet", True)
 
         # 1. Down-Projection (Compression) - High Precision
         self.W_Down = nn.Linear(self.d_model, self.d_latent, bias=False)
@@ -112,7 +135,6 @@ class Gated_DiBA_OLDA_Attention(nn.Module):
         v = self.W_U_Val(c_kv).view(B, S, self.n_heads, self.d_head)
 
         # D. RoPE (Signal Only)
-        # Assuming BlueberryLLM uses the same apply_rope signature
         q_sig, k_sig = apply_rope(q_sig, k_sig, freqs_cis)
 
         # Transpose to (B, H, S, D)
@@ -123,7 +145,8 @@ class Gated_DiBA_OLDA_Attention(nn.Module):
         # E. Attention Scores
         scale = 1.0 / math.sqrt(self.d_head)
         # Simple causal mask (assuming flash attention isn't available for custom diff logic yet)
-        mask = torch.triu(torch.ones(S, S, device=x.device) * float('-inf'), diagonal=1)
+        mask = torch.full((S, S), float('-inf'), device=x.device, dtype=x.dtype)
+        mask = torch.triu(mask, diagonal=1)
 
         s_sig = (torch.matmul(q_sig, k_sig.transpose(-2, -1)) * scale) + mask
         s_noise = (torch.matmul(q_noise, k_noise.transpose(-2, -1)) * scale) + mask
