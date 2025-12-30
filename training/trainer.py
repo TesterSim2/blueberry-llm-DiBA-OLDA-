@@ -42,6 +42,21 @@ class EarlyStopping:
             return False
 
 
+def compute_orthogonality_loss(model: nn.Module) -> Optional[torch.Tensor]:
+    """Aggregate orthogonality penalties from all modules that expose get_ortho_loss."""
+    ortho_losses = []
+    for module in model.modules():
+        get_loss = getattr(module, "get_ortho_loss", None)
+        if callable(get_loss):
+            loss = get_loss()
+            if loss is not None:
+                ortho_losses.append(loss)
+
+    if not ortho_losses:
+        return None
+    return torch.stack(ortho_losses).sum()
+
+
 def setup_muon_optimizer(model: nn.Module, config: MoEModelConfig):
     """Setup Muon optimizer with hybrid approach"""
     muon_params = []
@@ -168,6 +183,10 @@ def train_model(
                     if aux_loss is not None:
                         total_loss = total_loss + aux_loss
 
+                    ortho_loss = compute_orthogonality_loss(model) if getattr(config, "ortho_gamma", 0.0) else None
+                    if ortho_loss is not None:
+                        total_loss = total_loss + (config.ortho_gamma * ortho_loss)
+
                     loss = total_loss / config.gradient_accumulation_steps
                 scaler.scale(loss).backward()
             else:
@@ -182,6 +201,10 @@ def train_model(
                 total_loss = ce_loss
                 if aux_loss is not None:
                     total_loss = total_loss + aux_loss
+
+                ortho_loss = compute_orthogonality_loss(model) if getattr(config, "ortho_gamma", 0.0) else None
+                if ortho_loss is not None:
+                    total_loss = total_loss + (config.ortho_gamma * ortho_loss)
 
                 loss = total_loss / config.gradient_accumulation_steps
                 loss.backward()
@@ -219,6 +242,7 @@ def train_model(
                 pbar.set_postfix({
                     'loss': f'{current_loss:.4f}',
                     'aux': f'{aux_loss.item() if aux_loss is not None else 0:.4f}',
+                    'ortho': f'{ortho_loss.item() if ortho_loss is not None else 0:.4f}',
                     'acc': f'{accuracy:.3f}',
                     'ppl': f'{perplexity:.1f}',
                     'lr': f'{current_lr:.5f}'

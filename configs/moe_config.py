@@ -37,6 +37,7 @@ class MoEModelConfig:
     weight_decay: float = 0.2
     dropout: float = 0.1
     grad_clip: float = 1.0
+    ortho_gamma: float = 0.05
 
     # Technical
     use_amp: bool = True
